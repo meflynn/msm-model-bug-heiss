@@ -1,0 +1,199 @@
+---
+title: "MSM Weirdness Check"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(broom)
+library(broom.mixed)
+library(lme4)
+library(fixest)
+library(fabricatr)
+library(ipw)
+
+
+# outcome = national happiness
+# treatment = vacation days
+# time-varying confounders = corruption and democracy
+# time-invarying confounders = country
+
+set.seed(1234)
+panel_data <- fabricate(
+  years = add_level(
+    # Create 3 years
+    # Technically this is 4 years, but I want a preceding year when lagging, so
+    # we make 4, lag stuff, and then lop off the first year
+    N = 20,
+    year = 0:19
+  ),
+  countries = add_level(
+    # Create 100 countries
+    N = 100,
+    
+    # Country-specific trends
+    c_democracy_base = runif(N, 0.2, 0.6),
+    c_democracy_growth = rnorm(N, 0, 0.05),
+    c_democracy_error = runif(N, 0, 0.05),
+    c_corruption_base = runif(N, 0.1, 0.6),
+    c_corruption_growth = rnorm(N, 0, 0.04),
+    c_corruption_error = runif(N, 0, 0.01),
+    
+    # Treatment
+    c_vacation_base = runif(N, 10, 16),
+    c_vacation_growth = rnorm(N, 0.75, 0.75),
+    
+    # Outcome
+    c_happiness_base = runif(N, 20, 45),
+    c_happiness_growth = rnorm(N, 0.4, 0.05),
+    c_happiness_error = runif(N, 0, 0.7),
+    
+    nest = FALSE
+  ),
+  country_years = cross_levels(
+    by = join(years, countries),
+    
+    # Make democracy and corruption change over time
+    democracy = c_democracy_base + (year * c_democracy_growth) + rnorm(N, sd = c_democracy_error),
+    corruption = c_corruption_base + (year * c_corruption_growth) + rnorm(N, sd = c_corruption_error),
+    # Scale up
+    democracy = 100 * democracy,
+    corruption = 100 * corruption,
+    
+    # Treatment - caused by previous treatment, democracy and corruption 
+    vacation_days = c_vacation_base + 
+      (year * c_vacation_growth) +  # Previous treatment (i.e. treatment trend)
+      (0.2 * democracy) +   # Democracy
+      (-0.2 * corruption),  # Corruption
+
+    # Outcome - caused by previous outcome, democracy, corruption, and vacation days
+    happiness = c_happiness_base + 
+      (year * c_happiness_growth) +  # Previous outcome (i.e. outcome trend)
+      rnorm(N, sd = c_happiness_error) +  # Noise
+      (0.3 * democracy) +  # Democracy effect
+      (-0.2 * corruption) +  # Corruption effect
+      (4 * vacation_days)  # Vacation effect; THIS IS THE CAUSAL EFFECT
+  )
+) %>% 
+  # Remove and rearrange columns
+  select(-years, country = countries, -country_years, 
+         -starts_with("y_"), -starts_with("c_")) %>% 
+  select(country, year, vacation_days, happiness, everything()) %>% 
+  # Lag things
+  group_by(country) %>% 
+  mutate(lag_vacation_days = lag(vacation_days),
+         lag_happiness = lag(happiness)) %>% 
+  ungroup() %>% 
+  # Remove first year now that we've lagged stuff
+  filter(year != 0)
+panel_data
+#> # A tibble: 300 x 8
+#>    country  year vacation_days happiness democracy corruption lag_vacation_da…
+#>    <chr>   <int>         <dbl>     <dbl>     <dbl>      <dbl>            <dbl>
+#>  1 001         1          5.61      40.8     15.7        46.0             6.67
+#>  2 001         2          4.87      35.6      8.62       47.8             5.61
+#>  3 001         3          3.34      25.6     -2.38       49.6             4.87
+#>  4 002         1         18.6      112.      43.9        36.1            17.2 
+#>  5 002         2         17.6      103.      33.7        39.9            18.6 
+#>  6 002         3         17.8      104.      29.0        43.1            17.6 
+#>  7 003         1         11.9       71.9     35.9        50.7            12.3 
+#>  8 003         2         13.1       76.1     34.8        52.3            11.9 
+#>  9 003         3         13.5       75.0     27.3        52.1            13.1 
+#> 10 004         1         10.6       66.0     43.5        51.3            10.5 
+#> # … with 290 more rows, and 1 more variable: lag_happiness <dbl>
+
+ggplot(panel_data, aes(x = year, y = happiness, group = country)) +
+  geom_line(alpha = 0.3)
+```
+
+
+
+
+```{r}
+
+# Note I changed this just to make sure I got it right since I didn't know the other syntax that well.
+simple_fe_ols <- lm(happiness ~ vacation_days + democracy + corruption + factor(year) + factor(country),
+                       data = panel_data)
+tidy(simple_fe_ols)
+
+
+# Ok, let's try the original
+model_num <- lm(vacation_days ~ lag_vacation_days + country, 
+                data = panel_data)
+
+# Calculate the probability distribution
+num <- dnorm(panel_data$vacation_days,
+             predict(model_num),
+             sd(residuals(model_num)))
+
+# Denominator is lagged treatment (vacation days), lagged outcome (happiness),
+# time-varying confounders (democracy and corruption), and time-invarying
+# confounders (country)
+model_denom <- lm(vacation_days ~ lag_vacation_days + lag_happiness +
+                    democracy + corruption + country, 
+                  data = panel_data)
+
+# Calculate the probability distribution
+den <- dnorm(panel_data$vacation_days,
+             predict(model_denom),
+             sd(residuals(model_denom)))
+
+panel_data_weights <- panel_data %>% 
+  mutate(weights_sans_time = num / den) %>% 
+  group_by(country) %>% 
+  mutate(ipw = cumprod(weights_sans_time)) %>% 
+  ungroup()
+
+
+# Outcome models
+outcome_model_manual_weights <- lmer(happiness ~ vacation_days + lag_vacation_days + 
+                                       (1 | country) + (1 | year), 
+                                     data = panel_data_weights, 
+                                     weights = ipw)
+# 5.67 is close, but not 4 :(
+tidy(outcome_model_manual_weights, effects = "fixed")
+```
+
+```{r}
+
+# Ok, now let's try it with some modifications
+model_num <- lm(vacation_days ~ lag_vacation_days + country, 
+                data = panel_data)
+
+# Calculate the probability distribution
+num <- dnorm(panel_data$vacation_days,
+             predict(model_num),
+             sd(residuals(model_num)))
+
+# For the denominator I think you need the year variable in here
+model_denom <- lm(vacation_days ~ lag_vacation_days + lag_happiness +
+                    democracy + corruption + year + country, 
+                  data = panel_data)
+
+# Calculate the probability distribution
+den <- dnorm(panel_data$vacation_days,
+             predict(model_denom),
+             sd(residuals(model_denom)))
+
+panel_data_weights <- panel_data %>% 
+  mutate(weights_sans_time = num / den) %>% 
+  group_by(country) %>% 
+  mutate(ipw = cumprod(weights_sans_time),
+         ipw_truncated = ifelse(ipw > 100, 100, ipw)) %>% 
+  ungroup()
+
+
+# Outcome models
+# 1. I think the lag of vacation days needs to be omitted here since it's already in the weighting models
+# 2. I also thinkt he year variable needs to be dropped as a grouping variable here. You  have time trends built in from what I can see, but I think the two intercepts is throwing everything off since the real grouping variable is within country. I've also decided to not use grouping variables for time in somee of my own models because we only have three years of data and my understanding of Snijders and Bosker's MLM text is that the fixed effect estimates (i.e. binary fixed effects) are better when the number of groups is quite small.
+
+outcome_model_manual_weights <- lmer(happiness ~ vacation_days +
+                                       (1 | country) , 
+                                     data = panel_data_weights, 
+                                     weights = ipw_truncated)
+# 5.67 is close, but not 4 :(
+tidy(outcome_model_manual_weights, effects = "fixed")
+
+# Keep working on it later...
+```
+
